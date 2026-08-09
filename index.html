@@ -464,6 +464,12 @@ function setHub(hubKey) {
   activeHub = hubKey;
   const hub = HUBS[hubKey];
   REGIONS = hub.regions; REGION_FULL = hub.full; NATION_REGIONS = hub.nation;
+
+  // Choose the most useful shift when a hub is opened.
+  // UK time 11:00–20:59 = PM; all other times = AM.
+  shift = getDefaultShiftForCurrentTime();
+  document.getElementById('shiftBtn').textContent = shift;
+
   document.getElementById('hubName').textContent = hub.name;
   document.getElementById('hubPicker').style.display = 'none';
   document.getElementById('appShell').style.display = 'flex';
@@ -489,6 +495,23 @@ function setHub(hubKey) {
 }
 
 // ── SHIFT / MODE ─────────────────────────
+function getDefaultShiftForCurrentTime() {
+  try {
+    // Use UK time explicitly so the behaviour remains correct through GMT/BST
+    // even if a reader's computer is set to another time zone.
+    const hour = Number(new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Europe/London',
+      hour: '2-digit',
+      hourCycle: 'h23'
+    }).format(new Date()));
+    return hour >= 11 && hour < 21 ? 'PM' : 'AM';
+  } catch (err) {
+    // Very old browsers: fall back to the device's local hour.
+    const hour = new Date().getHours();
+    return hour >= 11 && hour < 21 ? 'PM' : 'AM';
+  }
+}
+
 function cycleShift() { setShift(shift === 'AM' ? 'PM' : 'AM'); }
 function setShift(s) {
   shift = s;
