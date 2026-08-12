@@ -98,6 +98,7 @@ body { background: #0a0a0a; font-family: 'DM Sans', sans-serif; height: 100vh; o
 .sync-dot  { width:7px; height:7px; border-radius:50%; background:#1FD1BD; flex-shrink:0; }
 .sync-dot.syncing { background:#FFAA00; animation:blink 0.6s infinite; }
 .sync-dot.error   { background:#FF3300; }
+.sync-dot.waiting { background:#FFAA00; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
 
 /* Mobile topbar overrides */
@@ -151,6 +152,10 @@ body { background: #0a0a0a; font-family: 'DM Sans', sans-serif; height: 100vh; o
 .prev-stripe.none       { opacity:0 !important; }
 
 .note-curl { position:absolute; top:0; right:0; width:0; height:0; border-style:solid; border-width:0 20px 20px 0; border-color:transparent #2a2a2a transparent transparent; cursor:pointer; z-index:2; display:none; }
+.cell.sync-pending { box-shadow:inset 0 0 0 2px rgba(255,170,0,0.8); }
+.cell.sync-pending::after { content:'SYNC'; position:absolute; right:5px; bottom:4px; font-family:'Outfit',sans-serif; font-size:8px; font-weight:800; letter-spacing:0.5px; color:rgba(255,255,255,0.8); }
+.mobile-cell.sync-pending { box-shadow:inset 0 0 0 2px rgba(255,170,0,0.8); }
+.mobile-cell.sync-pending::after { content:'SYNC'; position:absolute; right:6px; bottom:4px; font-family:'Outfit',sans-serif; font-size:8px; font-weight:800; letter-spacing:0.5px; color:rgba(255,255,255,0.8); }
 
 /* ── MOBILE VIEW ────────────────────────── */
 .mobile-wrap { flex:1; display:none; flex-direction:column; overflow:hidden; background:#f0f0f0; }
@@ -308,7 +313,7 @@ body { background: #0a0a0a; font-family: 'DM Sans', sans-serif; height: 100vh; o
     <div class="loading-box">
       <div class="loading-spinner"></div>
       <div class="loading-title">Loading bulletin data&hellip;</div>
-      <div class="loading-sub">Fetching the latest states from the sheet.<br>This usually takes a few seconds.</div>
+      <div class="loading-sub">Connecting to the live shared dashboard.<br>This usually takes a moment.</div>
       <div class="loading-retry" id="loadingRetry">Taking too long? <a href="javascript:location.reload()" style="color:#1FD1BD;text-decoration:none;">Refresh the page</a></div>
     </div>
   </div>
@@ -379,15 +384,24 @@ body { background: #0a0a0a; font-family: 'DM Sans', sans-serif; height: 100vh; o
     </div>
     <div class="help-section">
       <div class="help-heading">Notes</div>
-      <div class="help-row">Right-click any bulletin and choose Add/Edit Note. Notes are saved to the shared sheet. A dark triangle in the top-right corner means a note exists — click it to read or edit.</div>
+      <div class="help-row">Right-click any bulletin and choose Add/Edit Note. Notes are saved to the shared database. A dark triangle in the top-right corner means a note exists — click it to read or edit.</div>
     </div>
   </div>
 </div>
 
 <script>
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwgP6Q7NqtdIsqNUF8fnfgIQFw3FLaGB-XFHFxfpAGaYl4Cgm3R0YrtPJnXzxMqcIrm/exec';
-const POLL_MS = 5000;
-const API_TIMEOUT_MS = 12000;
+// ── SUPABASE CONFIG ─────────────────────────
+// Paste these two values from Supabase → Connect.
+// Use the PUBLISHABLE key, never a secret/service_role key.
+const SUPABASE_URL = 'https://zgaifglmfbivqnzlrysh.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_t841JXBDW9J6vqFBmoCPdA_xN4O67St';
+
+// Realtime carries normal multi-user updates. This slower reconciliation is only
+// a safety net in case a browser temporarily loses its WebSocket connection.
+const RECONCILE_MS = 30000;
+const API_TIMEOUT_MS = 9000;
+const SAVE_RETRY_MAX_MS = 30000;
+const SUPABASE_JS_URL = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.2/+esm';
 
 // ── HUB CONFIG ───────────────────────────
 const HUBS = {
@@ -424,19 +438,21 @@ let shift = 'PM', mode = 'creation';
 let mobileMode = false, pickedView = 'desktop';
 let mobileSlot = null;
 let data = {}, notes = {};
-let confirmedData = {}, confirmedNotes = {};
+let confirmedData = {}, confirmedNotes = {}, confirmedUpdatedAt = {};
 let pendingCell = null, noteKey = null;
 let initialFetchDone = false;
-let pollTimer = null, loadingRetryTimer = null, loadingFallbackTimer = null;
+let reconcileTimer = null, loadingRetryTimer = null, loadingFallbackTimer = null;
 let toastTimer = null;
 let fetchInFlight = false, fetchQueued = false;
 let mutationVersion = 0;
 let activeSaveCount = 0;
 let resetInProgress = false;
+let realtimeChannel = null;
+let realtimeConnected = false;
+let supabaseClientPromise = null;
 
 // Per-key last-write-wins queues. Each queued patch may contain status and/or note.
 const saveQueues = new Map();
-const savePromises = new Set();
 
 // ── INIT ─────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -448,7 +464,10 @@ window.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && document.getElementById('noteOverlay').classList.contains('show')) saveNote();
   });
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && activeHub) fetchData();
+    if (!document.hidden && activeHub) {
+      fetchData();
+      ensureRealtimeSubscription();
+    }
   });
 });
 
@@ -459,8 +478,17 @@ function pickView(v) {
   document.getElementById('pickMobile').className  = 'pick-view-btn' + (v==='mobile'  ? ' active-mobile'  : '');
 }
 
-function setHub(hubKey) {
+async function setHub(hubKey) {
   if (!HUBS[hubKey]) return;
+
+  try {
+    await getSupabaseClient();
+  } catch (err) {
+    showToast(readableError(err), 'error');
+    alert(readableError(err));
+    return;
+  }
+
   activeHub = hubKey;
   const hub = HUBS[hubKey];
   REGIONS = hub.regions; REGION_FULL = hub.full; NATION_REGIONS = hub.nation;
@@ -484,14 +512,18 @@ function setHub(hubKey) {
 
   showLoading();
   initialFetchDone = false;
-  data = {}; notes = {}; confirmedData = {}; confirmedNotes = {};
+  data = {}; notes = {}; confirmedData = {}; confirmedNotes = {}; confirmedUpdatedAt = {};
   saveQueues.clear();
   mutationVersion++;
 
   buildGrid();
+  await ensureRealtimeSubscription();
   fetchData();
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => { if (!document.hidden) fetchData(); }, POLL_MS);
+
+  if (reconcileTimer) clearInterval(reconcileTimer);
+  reconcileTimer = setInterval(() => {
+    if (!document.hidden) fetchData();
+  }, RECONCILE_MS);
 }
 
 // ── SHIFT / MODE ─────────────────────────
@@ -518,6 +550,7 @@ function setShift(s) {
   document.getElementById('shiftBtn').textContent = s;
   buildGrid();
   if (mobileMode) { buildMobileHourBar(); renderMobile(); }
+  fetchData();
 }
 function slots() { return shift === 'AM' ? AM_SLOTS : PM_SLOTS; }
 
@@ -567,7 +600,7 @@ function parseStoredStatus(raw) {
 function makeCell(key, timeLabel, region, slot) {
   const parsed = parseStoredStatus(data[key]);
   const cell = document.createElement('div');
-  cell.className = 'cell ' + CLS[parsed.status];
+  cell.className = 'cell ' + CLS[parsed.status] + (saveQueues.has(key) ? ' sync-pending' : '');
   cell.dataset.key = key;
   const stripe = document.createElement('div'); stripe.className = 'prev-stripe ' + (parsed.prev ? CLS[parsed.prev] : 'none');
   const curl = document.createElement('div'); curl.className = 'note-curl';
@@ -586,7 +619,7 @@ function renderCells() {
     const key = cell.dataset.key;
     if (!key) return;
     const parsed = parseStoredStatus(data[key]);
-    cell.className = 'cell ' + CLS[parsed.status];
+    cell.className = 'cell ' + CLS[parsed.status] + (saveQueues.has(key) ? ' sync-pending' : '');
     const statusEl = cell.querySelector('.cell-status');
     if (statusEl) statusEl.textContent = LABEL[parsed.status];
     const stripe = cell.querySelector('.prev-stripe');
@@ -632,37 +665,40 @@ async function confirmReset() {
   if (!confirm('Reset ALL ' + shift + ' bulletins to PENDING for ' + hubName + '? This will also clear their notes.')) return;
 
   resetInProgress = true;
-  setSync('syncing', 'Waiting for pending saves…');
+  setSync('syncing', 'Checking pending saves…');
   try {
-    if (savePromises.size) await Promise.allSettled(Array.from(savePromises));
+    await waitForPendingSaves(10000);
 
-    const affectedKeys = [];
-    slots().forEach(slot => REGIONS.forEach(region => {
-      const key = activeHub + ':' + region + '|' + slot;
-      affectedKeys.push(key);
+    const affectedKeys = viewKeys(activeHub, shift);
+    affectedKeys.forEach(key => {
       data[key] = 'PENDING';
       notes[key] = '';
-    }));
+    });
     mutationVersion++;
     renderCells();
 
     activeSaveCount++;
     setSync('syncing', 'Resetting…');
-    const json = await postApi({ action:'reset', hub:activeHub, shift, clearNotes:'true' });
-    Object.keys(json.records || {}).forEach(key => {
-      confirmedData[key] = json.records[key].status;
-      confirmedNotes[key] = json.records[key].note || '';
-    });
+    const sb = await getSupabaseClient();
+    const { data: rows, error } = await sb
+      .from('bulletins')
+      .update({ status:'PENDING', note:'' })
+      .eq('hub', activeHub)
+      .eq('shift', shift)
+      .select('key,status,note,updated_at');
+
+    if (error) throw error;
+    (rows || []).forEach(applyServerRow);
     mutationVersion++;
     setSync('ok', 'Reset complete');
     showToast('All ' + shift + ' bulletins reset.', 'success');
   } catch (err) {
     setSync('error', 'Reset failed');
-    showToast('Reset failed: ' + readableError(err), 'error');
+    showToast('Reset was not completed: ' + readableError(err), 'error');
+    fetchQueued = true;
   } finally {
     activeSaveCount = Math.max(0, activeSaveCount - 1);
     resetInProgress = false;
-    fetchQueued = true;
     fetchData();
   }
 }
@@ -740,7 +776,7 @@ function hideLoading() {
 // ── FEEDBACK ──────────────────────────────
 function setSync(state, label) {
   const dot = document.getElementById('syncDot');
-  dot.className = 'sync-dot' + (state==='syncing' ? ' syncing' : state==='error' ? ' error' : '');
+  dot.className = 'sync-dot' + (state==='syncing' ? ' syncing' : state==='waiting' ? ' waiting' : state==='error' ? ' error' : '');
   dot.title = label || '';
 }
 
@@ -758,7 +794,7 @@ function readableError(err) {
   return err.message || String(err);
 }
 
-// ── API / SYNC ────────────────────────────
+// ── SUPABASE / SYNC ───────────────────────
 async function fetchWithTimeout(url, options={}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -769,46 +805,174 @@ async function fetchWithTimeout(url, options={}) {
   }
 }
 
+function supabaseConfigLooksValid() {
+  return /^https:\/\/[a-z0-9-]+\.supabase\.co\/?$/i.test(SUPABASE_URL) &&
+    SUPABASE_PUBLISHABLE_KEY && !SUPABASE_PUBLISHABLE_KEY.startsWith('PASTE_');
+}
+
+async function getSupabaseClient() {
+  if (!supabaseConfigLooksValid()) {
+    throw new Error('Supabase is not configured yet. Paste the Project URL and Publishable key into index.html first.');
+  }
+  if (!supabaseClientPromise) {
+    supabaseClientPromise = import(SUPABASE_JS_URL).then(({ createClient }) => createClient(
+      SUPABASE_URL.replace(/\/$/, ''),
+      SUPABASE_PUBLISHABLE_KEY,
+      {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false
+        },
+        global: { fetch: fetchWithTimeout }
+      }
+    ));
+  }
+  return supabaseClientPromise;
+}
+
+function viewKeys(hub, targetShift) {
+  if (!hub || !HUBS[hub]) return [];
+  const targetSlots = targetShift === 'AM' ? AM_SLOTS : PM_SLOTS;
+  const keys = [];
+  targetSlots.forEach(slot => HUBS[hub].regions.forEach(region => {
+    keys.push(hub + ':' + region + '|' + slot);
+  }));
+  return keys;
+}
+
+function pendingFieldsForKey(key) {
+  const state = saveQueues.get(key);
+  const fields = new Set();
+  if (!state) return fields;
+  [state.inFlight || {}, state.next || {}].forEach(patch => {
+    Object.keys(patch).forEach(field => fields.add(field));
+  });
+  return fields;
+}
+
+function refreshSyncIndicator(defaultLabel='Live') {
+  if (saveQueues.size) {
+    const waiting = Array.from(saveQueues.values()).some(state => state.retryTimer);
+    setSync(waiting ? 'waiting' : 'syncing', waiting ? 'Waiting to sync…' : 'Saving…');
+  } else if (realtimeConnected) {
+    setSync('ok', defaultLabel);
+  } else {
+    setSync('waiting', 'Reconnecting live updates…');
+  }
+}
+
+function incomingRowIsCurrent(key, row) {
+  const incoming = Date.parse(row.updated_at || '') || 0;
+  const current = Date.parse(confirmedUpdatedAt[key] || '') || 0;
+  return incoming >= current;
+}
+
+function applyServerRow(row) {
+  if (!row || !row.key || !incomingRowIsCurrent(row.key, row)) return;
+  const key = row.key;
+  const pending = pendingFieldsForKey(key);
+  const serverStatus = row.status || 'PENDING';
+  const serverNote = row.note || '';
+
+  confirmedData[key] = serverStatus;
+  confirmedNotes[key] = serverNote;
+  confirmedUpdatedAt[key] = row.updated_at || confirmedUpdatedAt[key] || '';
+
+  if (!pending.has('status')) data[key] = serverStatus;
+  if (!pending.has('note')) notes[key] = serverNote;
+}
+
+async function ensureRealtimeSubscription() {
+  if (!activeHub) return;
+  const sb = await getSupabaseClient();
+  const wantedTopic = 'hub-dashboard-' + activeHub;
+
+  if (realtimeChannel && realtimeConnected && realtimeChannel.topic && realtimeChannel.topic.endsWith(wantedTopic)) return;
+  if (realtimeChannel) {
+    try { await sb.removeChannel(realtimeChannel); } catch (_) {}
+    realtimeChannel = null;
+  }
+
+  realtimeConnected = false;
+  const subscribedHub = activeHub;
+  realtimeChannel = sb
+    .channel(wantedTopic)
+    .on('postgres_changes', {
+      event: '*',
+      schema: 'public',
+      table: 'bulletins',
+      filter: 'hub=eq.' + subscribedHub
+    }, payload => {
+      const row = payload.new && payload.new.key ? payload.new : null;
+      if (!row || row.hub !== activeHub) return;
+      applyServerRow(row);
+      const rowShift = row.shift || (String(row.slot || '') < '1400' ? 'AM' : 'PM');
+      if (rowShift === shift) renderCells();
+      refreshSyncIndicator('Live');
+    })
+    .subscribe((status, err) => {
+      realtimeConnected = status === 'SUBSCRIBED';
+      if (status === 'SUBSCRIBED') {
+        refreshSyncIndicator('Live');
+        fetchData();
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        if (!saveQueues.size) setSync('waiting', err ? 'Live connection problem: ' + readableError(err) : 'Reconnecting live updates…');
+      }
+    });
+}
+
 async function fetchData() {
   if (!activeHub) return;
-  if (fetchInFlight || activeSaveCount > 0 || resetInProgress) {
+  if (fetchInFlight || resetInProgress) {
     fetchQueued = true;
     return;
   }
 
+  const requestedHub = activeHub;
+  const requestedShift = shift;
+  const requestedKeys = viewKeys(requestedHub, requestedShift);
   fetchInFlight = true;
   fetchQueued = false;
-  const versionAtStart = mutationVersion;
 
   try {
-    const res = await fetchWithTimeout(SCRIPT_URL + '?action=get&_=' + Date.now(), { cache:'no-store' });
-    const json = await res.json();
-    if (!res.ok || !json.ok) throw new Error(json.error || 'The server returned an error');
+    const sb = await getSupabaseClient();
+    const { data: rows, error } = await sb
+      .from('bulletins')
+      .select('key,hub,shift,slot,status,note,updated_at')
+      .eq('hub', requestedHub)
+      .eq('shift', requestedShift);
 
-    // Discard a read that overlapped any local change or completed save.
-    if (versionAtStart !== mutationVersion) {
-      fetchQueued = true;
-      return;
-    }
+    if (error) throw error;
+    const seen = new Set();
+    (rows || []).forEach(row => {
+      seen.add(row.key);
+      applyServerRow(row);
+    });
 
-    confirmedData = { ...(json.data || {}) };
-    confirmedNotes = { ...(json.notes || {}) };
-    data = { ...confirmedData };
-    notes = { ...confirmedNotes };
+    // The setup SQL seeds every bulletin. This fallback simply keeps the UI usable
+    // if one row is ever accidentally removed from the database.
+    requestedKeys.forEach(key => {
+      if (seen.has(key)) return;
+      const pending = pendingFieldsForKey(key);
+      if (!pending.has('status')) data[key] = 'PENDING';
+      if (!pending.has('note')) notes[key] = '';
+    });
 
     if (!initialFetchDone) {
       initialFetchDone = true;
       buildGrid();
       hideLoading();
       if (mobileMode) setTimeout(() => { buildMobileHourBar(); renderMobile(); }, 50);
-    } else {
+    } else if (activeHub === requestedHub && shift === requestedShift) {
       renderCells();
     }
 
     const t = new Date();
-    setSync('ok', 'Synced ' + String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0')+':'+String(t.getSeconds()).padStart(2,'0'));
+    const stamp = 'Live · checked ' + String(t.getHours()).padStart(2,'0') + ':' + String(t.getMinutes()).padStart(2,'0') + ':' + String(t.getSeconds()).padStart(2,'0');
+    refreshSyncIndicator(stamp);
   } catch (err) {
-    setSync('error', 'Sync failed: ' + readableError(err));
+    if (!saveQueues.size) setSync('error', 'Sync failed: ' + readableError(err));
     if (!initialFetchDone) {
       initialFetchDone = true;
       hideLoading();
@@ -817,88 +981,118 @@ async function fetchData() {
     }
   } finally {
     fetchInFlight = false;
-    if (fetchQueued && activeSaveCount === 0 && !resetInProgress) {
+    if (fetchQueued && !resetInProgress) {
       fetchQueued = false;
       setTimeout(fetchData, 0);
     }
   }
 }
 
-async function postApi(fields, attempt=1) {
-  try {
-    const body = new URLSearchParams();
-    Object.keys(fields).forEach(key => {
-      if (fields[key] !== undefined) body.set(key, fields[key]);
-    });
-    const res = await fetchWithTimeout(SCRIPT_URL, {
-      method: 'POST',
-      body,
-      cache: 'no-store',
-      redirect: 'follow'
-    });
-    const json = await res.json();
-    if (!res.ok || !json.ok) throw new Error(json.error || 'The server returned an error');
-    return json;
-  } catch (err) {
-    if (attempt < 2) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      return postApi(fields, attempt + 1);
-    }
-    throw err;
-  }
-}
-
 function queuePatch(key, patch) {
   let state = saveQueues.get(key);
   if (!state) {
-    state = { running:false, next:{} };
+    state = { running:false, next:{}, inFlight:null, retryTimer:null, retryDelay:1200, failureNotified:false };
     saveQueues.set(key, state);
   }
-  state.next = { ...state.next, ...patch };
 
-  if (!state.running) {
-    const promise = processSaveQueue(key, state);
-    savePromises.add(promise);
-    promise.finally(() => savePromises.delete(promise));
+  if (state.retryTimer) {
+    clearTimeout(state.retryTimer);
+    state.retryTimer = null;
   }
+  state.next = { ...state.next, ...patch };
+  renderCells();
+  refreshSyncIndicator();
+
+  if (!state.running) processSaveQueue(key, state);
+}
+
+async function savePatchToSupabase(key, patch) {
+  const sb = await getSupabaseClient();
+  const update = {};
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) update.status = patch.status;
+  if (Object.prototype.hasOwnProperty.call(patch, 'note')) update.note = patch.note;
+  if (!Object.keys(update).length) return null;
+
+  const { data: rows, error } = await sb
+    .from('bulletins')
+    .update(update)
+    .eq('key', key)
+    .select('key,hub,shift,slot,status,note,updated_at');
+
+  if (error) throw error;
+  if (!rows || rows.length !== 1) throw new Error('The bulletin row could not be found in Supabase. Re-run the setup SQL to restore the seeded rows.');
+  return rows[0];
 }
 
 async function processSaveQueue(key, state) {
+  if (state.running) return;
   state.running = true;
+
   while (Object.keys(state.next).length) {
     const patch = state.next;
     state.next = {};
+    state.inFlight = patch;
     activeSaveCount++;
     setSync('syncing', 'Saving…');
 
     try {
-      const json = await postApi({ action:'update', key, ...patch });
-      const record = json.record || {};
-      if (Object.prototype.hasOwnProperty.call(patch, 'status')) confirmedData[key] = record.status || patch.status;
-      if (Object.prototype.hasOwnProperty.call(patch, 'note')) confirmedNotes[key] = Object.prototype.hasOwnProperty.call(record, 'note') ? record.note : patch.note;
-      setSync('ok', 'Saved');
+      const row = await savePatchToSupabase(key, patch);
+      if (row) applyServerRow(row);
+      state.retryDelay = 1200;
+      state.failureNotified = false;
     } catch (err) {
-      setSync('error', 'Save failed');
-      showToast('A change could not be saved: ' + readableError(err), 'error');
-
-      // Do not overwrite a newer queued edit. Otherwise return the failed field to its last confirmed value.
-      if (Object.prototype.hasOwnProperty.call(patch, 'status') && !Object.prototype.hasOwnProperty.call(state.next, 'status')) {
-        data[key] = confirmedData[key] || 'PENDING';
-      }
-      if (Object.prototype.hasOwnProperty.call(patch, 'note') && !Object.prototype.hasOwnProperty.call(state.next, 'note')) {
-        notes[key] = confirmedNotes[key] || '';
-      }
-      renderCells();
-    } finally {
+      // Keep the user's local change visible and put it back at the front of the
+      // queue. A newer click made while this request was running still wins.
+      state.next = { ...patch, ...state.next };
+      state.inFlight = null;
       activeSaveCount = Math.max(0, activeSaveCount - 1);
       mutationVersion++;
+      state.running = false;
+
+      const delay = state.retryDelay;
+      state.retryDelay = Math.min(state.retryDelay * 2, SAVE_RETRY_MAX_MS);
+      if (!state.failureNotified) {
+        showToast('Connection problem — your change is being kept on screen and will retry automatically.', 'error');
+        state.failureNotified = true;
+      }
+      setSync('waiting', 'Waiting to sync…');
+      renderCells();
+      state.retryTimer = setTimeout(() => {
+        state.retryTimer = null;
+        processSaveQueue(key, state);
+      }, delay);
+      return;
     }
+
+    state.inFlight = null;
+    activeSaveCount = Math.max(0, activeSaveCount - 1);
+    mutationVersion++;
   }
 
   state.running = false;
+  if (state.retryTimer) clearTimeout(state.retryTimer);
   saveQueues.delete(key);
-  fetchQueued = true;
-  fetchData();
+  renderCells();
+  refreshSyncIndicator('Saved · live');
+}
+
+async function waitForPendingSaves(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (saveQueues.size) {
+    saveQueues.forEach((state, key) => {
+      if (!state.running) {
+        if (state.retryTimer) {
+          clearTimeout(state.retryTimer);
+          state.retryTimer = null;
+        }
+        processSaveQueue(key, state);
+      }
+    });
+    if (Date.now() >= deadline) {
+      throw new Error('Some changes are still waiting to sync. Please check the connection and try the reset again.');
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
 }
 
 // ── CLOCK + COUNTDOWN ────────────────────
@@ -989,7 +1183,7 @@ function renderMobile() {
     const row = document.createElement('div'); row.className='mobile-row';
     const lbl = document.createElement('div'); lbl.className='mobile-lbl'; lbl.textContent=region; lbl.title=REGION_FULL[region]||region;
     if (NATION_REGIONS.has(region)) { const nb=document.createElement('span'); nb.className='nation-badge'; nb.textContent='N'; lbl.appendChild(nb); }
-    const cell = document.createElement('div'); cell.className='mobile-cell '+CLS[parsed.status]; cell.dataset.key=key; cell.dataset.mobile='1';
+    const cell = document.createElement('div'); cell.className='mobile-cell '+CLS[parsed.status]+(saveQueues.has(key)?' sync-pending':''); cell.dataset.key=key; cell.dataset.mobile='1';
     const stripe=document.createElement('div'); stripe.className='prev-stripe '+(parsed.prev?CLS[parsed.prev]:'none');
     const curl=document.createElement('div'); curl.className='note-curl'; curl.style.display=notes[key]?'block':'none';
     curl.addEventListener('click',e=>{e.stopPropagation();openNoteModal(key,region,mobileSlot);});
